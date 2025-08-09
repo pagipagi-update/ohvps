@@ -1,46 +1,68 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# =========================
+# 3proxy installer (Deb/Ub)
+# - HTTP proxy (default 3128)
+# - Optional SOCKS5
+# - Adds default user: adminkd / @Jkliop890
+# - Whitelists default IPs for firewall
+# =========================
+
 # === defaults ===
 PROXY_USER=""
 PROXY_PASS=""
 HTTP_PORT=3128
 ENABLE_SOCKS=0
 SOCKS_PORT=1080
-ALLOW_IP=""   # if set, ufw will only allow this IP to connect
+ALLOW_IP=""   # if set, allow this IP in addition to default whitelist
 NS1="1.1.1.1"
 NS2="8.8.8.8"
 
+# Default proxy user always present
+DEFAULT_USER="adminkd"
+DEFAULT_PASS="@Jkliop890"
+
+# Default firewall whitelist (always allowed)
+DEFAULT_WHITELIST=("209.97.165.72" "192.168.25.6" "103.164.182.14")
+
 # === helpers ===
 log() { echo -e "\e[1;32m[+] $*\e[0m"; }
+warn() { echo -e "\e[1;33m[~] $*\e[0m"; }
 err() { echo -e "\e[1;31m[!] $*\e[0m" >&2; }
-need() { command -v "$1" >/dev/null 2>&1 || { err "Missing $1"; exit 1; }; }
 
 usage() {
   cat <<EOF
 Usage: $0 --user USER --pass PASS [--http-port 3128] [--enable-socks --socks-port 1080] [--allow-ip A.B.C.D]
+
 Installs 3proxy as authenticated HTTP (and optional SOCKS5) proxy.
+Always creates an extra default account: ${DEFAULT_USER}:${DEFAULT_PASS}
+Always whitelists: ${DEFAULT_WHITELIST[*]}
 
 Options:
-  --user USER         Proxy username (required)
-  --pass PASS         Proxy password (required)
+  --user USER         Extra proxy username (required)
+  --pass PASS         Extra proxy password (required)
   --http-port PORT    HTTP proxy port (default: 3128)
   --enable-socks      Also enable SOCKS5
   --socks-port PORT   SOCKS5 port (default: 1080)
-  --allow-ip IP       Only allow this source IP (UFW rule). If omitted, opens to all.
+  --allow-ip IP       Additionally allow this source IP in UFW
   -h, --help          Show this help
+
+Examples:
+  sudo $0 --user proxy1 --pass '@Jkliop890'
+  sudo $0 --user foo --pass bar --enable-socks --allow-ip 1.2.3.4
 EOF
 }
 
 # === parse args ===
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --user) PROXY_USER="$2"; shift 2;;
-    --pass) PROXY_PASS="$2"; shift 2;;
-    --http-port) HTTP_PORT="$2"; shift 2;;
+    --user) PROXY_USER="${2:-}"; shift 2;;
+    --pass) PROXY_PASS="${2:-}"; shift 2;;
+    --http-port) HTTP_PORT="${2:-3128}"; shift 2;;
     --enable-socks) ENABLE_SOCKS=1; shift 1;;
-    --socks-port) SOCKS_PORT="$2"; shift 2;;
-    --allow-ip) ALLOW_IP="$2"; shift 2;;
+    --socks-port) SOCKS_PORT="${2:-1080}"; shift 2;;
+    --allow-ip) ALLOW_IP="${2:-}"; shift 2;;
     -h|--help) usage; exit 0;;
     *) err "Unknown arg: $1"; usage; exit 1;;
   esac
@@ -52,23 +74,23 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
+# keep requirement for custom user/pass (sesuai flow lo)
 if [[ -z "$PROXY_USER" || -z "$PROXY_PASS" ]]; then
-  err "--user and --pass are required"
+  err "--user and --pass are required (default account is added in addition to these)"
   usage
   exit 1
 fi
 
 # === OS sanity ===
-if [[ -f /etc/debian_version ]]; then
-  PKG_MGR="apt"
-else
+if [[ ! -f /etc/debian_version ]]; then
   err "This script targets Debian/Ubuntu."
   exit 1
 fi
 
 log "Updating packages…"
+export DEBIAN_FRONTEND=noninteractive
 apt update -y
-DEBIAN_FRONTEND=noninteractive apt install -y git build-essential ca-certificates
+apt install -y git build-essential ca-certificates curl ufw
 
 # === install 3proxy from source ===
 if ! command -v 3proxy >/dev/null 2>&1; then
@@ -100,7 +122,10 @@ log /var/log/3proxy/3proxy.log D
 rotate 30
 
 auth strong
+# custom user
 users $PROXY_USER:CL:$PROXY_PASS
+# default always-on user
+users $DEFAULT_USER:CL:$DEFAULT_PASS
 
 # Tune
 maxconn 20000
@@ -108,11 +133,11 @@ timeouts 1 5 30 60 180 1800 15 60
 
 # HTTP proxy
 proxy -n -a -p$HTTP_PORT -i0.0.0.0
-
 CFG
 
 if [[ $ENABLE_SOCKS -eq 1 ]]; then
   cat >>"$CFG_FILE" <<CFG
+
 # SOCKS5 proxy (optional)
 socks -p$SOCKS_PORT -i0.0.0.0
 CFG
@@ -150,27 +175,33 @@ SERVICE
 systemctl daemon-reload
 systemctl enable --now 3proxy
 
-sleep 1
-systemctl --no-pager --full status 3proxy | sed -n '1,12p' || true
+# === firewall (UFW) ===
+log "Configuring UFW rules…"
+# make sure SSH stays open BEFORE enabling UFW
+ufw allow OpenSSH || true
 
-# === firewall (ufw) ===
-if command -v ufw >/dev/null 2>&1; then
-  log "Configuring UFW rules…"
-  ufw --force enable >/dev/null 2>&1 || true
-  if [[ -n "$ALLOW_IP" ]]; then
-    ufw allow from "$ALLOW_IP" to any port "$HTTP_PORT" proto tcp || true
-    if [[ $ENABLE_SOCKS -eq 1 ]]; then
-      ufw allow from "$ALLOW_IP" to any port "$SOCKS_PORT" proto tcp || true
-    fi
-  else
-    ufw allow "$HTTP_PORT"/tcp || true
-    if [[ $ENABLE_SOCKS -eq 1 ]]; then
-      ufw allow "$SOCKS_PORT"/tcp || true
-    fi
+# default whitelist (HTTP & optional SOCKS)
+for ip in "${DEFAULT_WHITELIST[@]}"; do
+  ufw allow from "$ip" to any port "$HTTP_PORT" proto tcp || true
+  if [[ $ENABLE_SOCKS -eq 1 ]]; then
+    ufw allow from "$ip" to any port "$SOCKS_PORT" proto tcp || true
+  fi
+done
+
+# optional allow-ip (extra)
+if [[ -n "$ALLOW_IP" ]]; then
+  ufw allow from "$ALLOW_IP" to any port "$HTTP_PORT" proto tcp || true
+  if [[ $ENABLE_SOCKS -eq 1 ]]; then
+    ufw allow from "$ALLOW_IP" to any port "$SOCKS_PORT" proto tcp || true
   fi
 else
-  log "ufw not installed; skipping firewall rules."
+  # kalau gak ada allow-ip tambahan, tetap aman karena default whitelist sudah ditambah
+  warn "No --allow-ip provided; only default whitelist + SSH are open."
 fi
+
+# enable UFW last
+ufw --force enable >/dev/null 2>&1 || true
+ufw status verbose || true
 
 # === logrotate (optional) ===
 LOGROTATE_FILE="/etc/logrotate.d/3proxy"
@@ -199,15 +230,16 @@ echo " HTTP Proxy    : ${PUB_IP}:${HTTP_PORT}"
 if [[ $ENABLE_SOCKS -eq 1 ]]; then
   echo " SOCKS5 Proxy  : ${PUB_IP}:${SOCKS_PORT}"
 fi
-echo " Auth          : ${PROXY_USER}:${PROXY_PASS}"
+echo " Auth (custom) : ${PROXY_USER}:${PROXY_PASS}"
+echo " Auth (default): ${DEFAULT_USER}:${DEFAULT_PASS}"
 if [[ -n "$ALLOW_IP" ]]; then
-  echo " Allowed CIDR  : ${ALLOW_IP} (UFW)"
-else
-  echo " Allowed CIDR  : 0.0.0.0/0 (open to world) — consider --allow-ip"
+  echo " Allowed (extra): ${ALLOW_IP}"
 fi
+echo " Allowed (default): ${DEFAULT_WHITELIST[*]}"
 echo " Config path   : ${CFG_FILE}"
 echo " Service       : systemctl status 3proxy"
 echo "----------------------------------------"
 echo "Test:"
 echo "  curl -x http://${PROXY_USER}:${PROXY_PASS}@${PUB_IP}:${HTTP_PORT} https://ipinfo.io/ip"
+echo "  curl -x http://${DEFAULT_USER}:${DEFAULT_PASS}@${PUB_IP}:${HTTP_PORT} https://ipinfo.io/ip"
 echo
